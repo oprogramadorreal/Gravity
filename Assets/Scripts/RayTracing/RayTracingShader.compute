@@ -1,0 +1,258 @@
+﻿// Based on:
+// - http://blog.three-eyed-games.com/2018/05/03/gpu-ray-tracing-in-unity-part-1/
+// - https://youtu.be/Cp5WWtMoeKg
+
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Result;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+Texture2D<float4> _SkyboxTexture;
+SamplerState sampler_SkyboxTexture;
+static const float PI = 3.14159265f;
+
+float4 _Light;
+int _LightBounceLimit;
+bool _IsPointLight; // if not point light, assume directional light
+
+float _BlendFactor;
+
+float2 _PixelOffset; // for anti-aliasing
+
+static const float epsilon = 0.001f;
+static const float maxTraceDistance = 1000.0f;
+
+struct Sphere
+{
+    float3 position;
+    float radius;
+    float3 albedo;
+    float3 specular;
+};
+
+StructuredBuffer<Sphere> _Spheres;
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+    float3 energy;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    ray.energy = float3(1.0f, 1.0f, 1.0f);
+    return ray;
+}
+
+struct RayHit
+{
+    float3 position;
+    float distance;
+    float3 normal;
+
+    float3 albedo;
+    float3 specular;
+};
+
+RayHit CreateRayHit()
+{
+    RayHit hit;
+    hit.position = float3(0.0f, 0.0f, 0.0f);
+    hit.distance = 1.#INF;
+    hit.normal = float3(0.0f, 0.0f, 0.0f);
+    hit.albedo = float3(0.0f, 0.0f, 0.0f);
+    hit.specular = float3(0.0f, 0.0f, 0.0f);
+    return hit;
+}
+
+float DistanceToSphere(float3 p, Sphere sphere)
+{
+    return distance(p, sphere.position) - sphere.radius;
+}
+
+struct SceneSample
+{
+    float distance;
+    float3 albedo;
+    float3 specular;
+};
+
+// polynomial smooth min (k = 0.1);
+// https://www.iquilezles.org/www/articles/smin/smin.htm
+SceneSample Blend(SceneSample a, SceneSample b, float k)
+{
+    float h = clamp(0.5 + 0.5 * (b.distance - a.distance) / k, 0.0, 1.0);
+
+    SceneSample blended;
+    blended.distance = lerp(b.distance, a.distance, h) - k * h * (1.0 - h);
+    blended.albedo = lerp(b.albedo, a.albedo, h);
+    blended.specular = lerp(b.specular, a.specular, h);
+
+    return blended;
+}
+
+SceneSample Sample(float3 p)
+{
+    SceneSample globalSample;
+    globalSample.distance = maxTraceDistance;
+    globalSample.albedo = float3(1.0f, 1.0f, 1.0f);
+    globalSample.specular = float3(1.0f, 1.0f, 1.0f);
+
+    uint numSpheres, stride;
+    _Spheres.GetDimensions(numSpheres, stride);
+
+    for (uint i = 0; i < numSpheres; ++i)
+    {
+        SceneSample currentSample;
+        currentSample.distance = DistanceToSphere(p, _Spheres[i]);
+        currentSample.albedo = _Spheres[i].albedo;
+        currentSample.specular = _Spheres[i].specular;
+
+        globalSample = Blend(globalSample, currentSample, _BlendFactor);
+    }
+
+    return globalSample;
+}
+
+float3 EstimateNormal(float3 p)
+{
+    float x = Sample(float3(p.x + epsilon, p.y, p.z)).distance - Sample(float3(p.x - epsilon, p.y, p.z)).distance;
+    float y = Sample(float3(p.x, p.y + epsilon, p.z)).distance - Sample(float3(p.x, p.y - epsilon, p.z)).distance;
+    float z = Sample(float3(p.x, p.y, p.z + epsilon)).distance - Sample(float3(p.x, p.y, p.z - epsilon)).distance;
+
+    return normalize(float3(x, y, z));
+}
+
+RayHit Trace(Ray ray)
+{
+    RayHit bestHit = CreateRayHit();
+
+    float currentDistance = 0.0f;
+
+    while (currentDistance < maxTraceDistance)
+    {
+        float3 currentPosition = ray.origin + ray.direction * currentDistance;
+
+        SceneSample currentSample = Sample(currentPosition);
+
+        if (currentSample.distance <= epsilon)
+        {
+            bestHit.distance = currentSample.distance;
+            bestHit.position = currentPosition;
+            bestHit.normal = EstimateNormal(currentPosition);
+            bestHit.albedo = currentSample.albedo;
+            bestHit.specular = currentSample.specular;
+            break;
+        }
+
+        currentDistance += currentSample.distance;
+    }
+
+    return bestHit;
+}
+
+float3 GetLightDirection(float3 p)
+{
+    if (_IsPointLight)
+    {
+        return p - _Light.xyz;
+    }
+
+    return _Light.xyz;
+}
+
+float3 Shade(uint3 id, inout Ray ray, RayHit hit, bool isFirstRay)
+{
+    if (hit.distance < 1.#INF)
+    {
+        // Reflect the ray and multiply energy with specular reflection
+        ray.origin = hit.position + hit.normal * 0.001f;
+        ray.direction = reflect(ray.direction, hit.normal);
+        ray.energy *= hit.specular;
+
+        float3 lightDirection = GetLightDirection(hit.position);
+
+        // Shadow test ray
+        bool shadow = false;
+        Ray shadowRay = CreateRay(hit.position + hit.normal * 0.001f, -1 * lightDirection);
+        RayHit shadowHit = Trace(shadowRay);
+        if (shadowHit.distance != 1.#INF)
+        {
+            return float3(0.0f, 0.0f, 0.0f);
+        }
+
+        // Return a diffuse-shaded color
+        return saturate(dot(hit.normal, lightDirection) * -1) * _Light.w * hit.albedo;
+    }
+    else
+    {
+        // Erase the ray's energy - the sky doesn't reflect anything
+        ray.energy = 0.0f;
+
+        if (isFirstRay)
+        {
+            return Source[id.xy].xyz;
+        }
+        else
+        {
+            // Sample the skybox and write it
+            float theta = acos(ray.direction.y) / -PI;
+            float phi = atan2(ray.direction.x, -ray.direction.z) / -PI * 0.5f;
+            return _SkyboxTexture.SampleLevel(sampler_SkyboxTexture, float2(phi, theta), 0).xyz;
+        }
+    }
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+
+    return CreateRay(origin, direction);
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    Result[id.xy] = Source[id.xy];
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + _PixelOffset) / float2(width, height) * 2.0f - 1.0f);
+
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+    // Trace and shade
+    float3 result = float3(0, 0, 0);
+    for (int i = 0; i < _LightBounceLimit; ++i)
+    {
+        RayHit hit = Trace(ray);
+        result += ray.energy * Shade(id, ray, hit, i == 0);
+
+        if (!any(ray.energy))
+        {
+            break;
+        }
+    }
+
+    Result[id.xy] = float4(result, 1);
+}
